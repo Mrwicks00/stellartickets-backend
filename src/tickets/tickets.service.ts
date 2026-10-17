@@ -16,7 +16,7 @@ import {
   TicketTypeSoldOutError,
 } from '../common/errors/domain.error';
 import { OrganizationsService } from '../organizations/organizations.service';
-import { StellarService } from '../stellar/stellar.service';
+import { SignedInvocation, StellarService } from '../stellar/stellar.service';
 import { AuditService } from '../audit/audit.service';
 import { NotificationService } from '../notifications/notifications.service';
 import { OfflineTokenService } from './offline-token.service';
@@ -83,10 +83,19 @@ export class TicketsService {
     seat: string | undefined,
     signedXdr: string,
   ) {
-    const { event } = await this.getTicketTypeWithEvent(ticketTypeId);
+    const { ticketType, event } =
+      await this.getTicketTypeWithEvent(ticketTypeId);
     await this.organizations.assertMember(event.organizationId, userId);
     const toUser = await this.getUserWithWallet(toUserId);
     this.assertRecipientPublicKey(toUser.stellarPublicKey, toPublicKey);
+    // #377 — the DB row must describe the ticket the chain will mint.
+    this.assertSignedInvocation(signedXdr, 'issue_ticket', [
+      ['organizer', 0, event.organization.stellarAccount],
+      ['event', 1, event.chainEventId],
+      ['recipient', 2, toUser.stellarPublicKey],
+      ['tier', 3, ticketType.name],
+      ['seat', 4, seat ?? UNASSIGNED_SEAT],
+    ]);
     // #211 — fail fast on duplicate assigned seats before touching the chain.
     await this.assertSeatAvailable(event.id, seat);
 
@@ -168,7 +177,16 @@ export class TicketsService {
     signedXdr: string,
     promoCode?: string,
   ) {
-    const { event } = await this.getTicketTypeWithEvent(ticketTypeId);
+    const { ticketType, event } =
+      await this.getTicketTypeWithEvent(ticketTypeId);
+    const buyer = await this.getUserWithWallet(buyerId);
+    // #377 — the DB row must describe the ticket the chain will mint.
+    this.assertSignedInvocation(signedXdr, 'purchase_primary', [
+      ['buyer', 0, buyer.stellarPublicKey],
+      ['event', 1, event.chainEventId],
+      ['tier', 2, ticketType.name],
+      ['seat', 3, seat ?? UNASSIGNED_SEAT],
+    ]);
     // #211 — fail fast on duplicate assigned seats before touching the chain.
     await this.assertSeatAvailable(event.id, seat);
     const { result, txHash } =
@@ -207,14 +225,12 @@ export class TicketsService {
     if (promoCode) {
       await this.promoCodes!.redeem(event.id, buyerId, promoCode, ticket.id);
     }
-    const buyer = await this.prisma.user.findUnique({ where: { id: buyerId } });
-    if (buyer && this.notifications) {
+    if (this.notifications) {
       await this.notifications.sendTicketReceipt({
         to: buyer.email,
         buyerName: buyer.name,
         eventName: event.name,
-        ticketType: (await this.getTicketTypeWithEvent(ticketTypeId)).ticketType
-          .name,
+        ticketType: ticketType.name,
         seat: seat ?? UNASSIGNED_SEAT,
       });
     }
@@ -249,13 +265,38 @@ export class TicketsService {
     toPublicKey: string,
     signedXdr: string,
   ) {
-    await this.getOwnedTicket(ticketId, userId);
+    const ticket = await this.getOwnedTicket(ticketId, userId);
     const toUser = await this.getUserWithWallet(toUserId);
     this.assertRecipientPublicKey(toUser.stellarPublicKey, toPublicKey);
+    // #375 — reject a transfer signed to a different wallet than toUserId's
+    // before it ever reaches the chain.
+    this.assertSignedInvocation(signedXdr, 'transfer_ticket', [
+      ['ticket', 1, ticket.chainTicketId],
+      ['recipient', 2, toUser.stellarPublicKey],
+    ]);
     await this.stellar.submitSignedTransaction(signedXdr);
-    return this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: { ownerId: toUserId, status: TicketStatus.VALID },
+
+    // #375 — the chain is the source of truth for ownership: only record
+    // toUserId once the on-chain owner is confirmed to be their wallet.
+    // `stellarPublicKey` is unique, so this is the user that wallet maps to.
+    const onChain = await this.stellar.verifyTicket(ticket.chainTicketId);
+    if (onChain.owner !== toUser.stellarPublicKey) {
+      throw new ConflictException(
+        'On-chain owner does not match the requested recipient',
+      );
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      // #378 — the contract clears a listing when a listed ticket is
+      // transferred; mirror that so the marketplace stops showing it.
+      await tx.resaleListing.updateMany({
+        where: { ticketId, status: ResaleListingStatus.ACTIVE },
+        data: { status: ResaleListingStatus.CANCELLED },
+      });
+      return tx.ticket.update({
+        where: { id: ticketId },
+        data: { ownerId: toUserId, status: TicketStatus.VALID },
+      });
     });
   }
 
@@ -533,7 +574,18 @@ export class TicketsService {
       ticket.event.maxResaleMultiplierBps,
     );
 
+    // #376 — the listing price is whatever the signed envelope sets, so the
+    // body price must agree with it before anything is submitted.
+    this.assertSignedInvocation(signedXdr, 'list_for_resale', [
+      ['ticket', 1, ticket.chainTicketId],
+      ['price', 2, BigInt(price)],
+    ]);
+
     const { txHash } = await this.stellar.submitSignedTransaction(signedXdr);
+    // #376 — store the price the chain actually recorded, not the body's.
+    const { resalePrice } = await this.stellar.verifyTicket(
+      ticket.chainTicketId,
+    );
 
     try {
       return await this.prisma.$transaction(async (tx) => {
@@ -545,12 +597,12 @@ export class TicketsService {
           data: {
             ticketId,
             sellerId: userId,
-            price: BigInt(price),
+            price: resalePrice,
             txHash,
             expiresAt: expiresAt ? new Date(expiresAt) : null,
             priceHistory: {
               create: {
-                price: BigInt(price),
+                price: resalePrice,
               },
             },
           },
@@ -1014,6 +1066,40 @@ export class TicketsService {
       throw new BadRequestException(
         'Recipient public key does not match target user',
       );
+    }
+  }
+
+  /**
+   * #375/#376/#377 — decodes the signed envelope and checks it calls `fn`
+   * with the values this request is about to record. Each `expected` entry
+   * is a label, the argument's position in the contract call, and the value
+   * it must hold. A mismatch is a 409: the client signed something other
+   * than what it asked us to record.
+   */
+  private assertSignedInvocation(
+    signedXdr: string,
+    fn: string,
+    expected: Array<[label: string, index: number, value: unknown]>,
+  ) {
+    let invocation: SignedInvocation;
+    try {
+      invocation = this.stellar.decodeSignedInvocation(signedXdr);
+    } catch (err) {
+      throw new BadRequestException(
+        `Signed transaction could not be decoded: ${(err as Error).message}`,
+      );
+    }
+    if (invocation.functionName !== fn) {
+      throw new ConflictException(
+        `Signed transaction calls ${invocation.functionName}, expected ${fn}`,
+      );
+    }
+    for (const [label, index, value] of expected) {
+      if (invocation.args[index] !== value) {
+        throw new ConflictException(
+          `Signed transaction ${label} does not match the request`,
+        );
+      }
     }
   }
 

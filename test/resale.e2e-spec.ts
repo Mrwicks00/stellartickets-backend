@@ -12,6 +12,7 @@ import { PrismaService } from '../src/prisma/prisma.service';
 import { StellarService } from '../src/stellar/stellar.service';
 import { JwtAuthGuard } from '../src/auth/guards/jwt-auth.guard';
 import type { CurrentUserPayload } from '../src/auth/decorators/current-user.decorator';
+import type { Ticket, User } from '@prisma/client';
 import {
   createEvent,
   createOrganization,
@@ -35,7 +36,17 @@ describe('Resale flow (e2e)', () => {
     submitSignedTransaction: jest
       .fn()
       .mockResolvedValue({ txHash: 'b'.repeat(64) }),
+    decodeSignedInvocation: jest.fn(),
+    verifyTicket: jest.fn().mockResolvedValue({ resalePrice: 1100n }),
   };
+
+  /** #376 — the signed envelope lists `ticket` at the body's 1100 price. */
+  function signListing(seller: User, ticket: Ticket) {
+    mockStellarService.decodeSignedInvocation.mockReturnValue({
+      functionName: 'list_for_resale',
+      args: [seller.stellarPublicKey, ticket.chainTicketId, 1100n],
+    });
+  }
 
   async function seedTicket(
     overrides: {
@@ -123,6 +134,7 @@ describe('Resale flow (e2e)', () => {
 
   it('lists a ticket for resale then cancels the listing', async () => {
     const { seller, ticket } = await seedTicket();
+    signListing(seller, ticket);
     currentUser = { userId: seller.id, email: seller.email, role: seller.role };
 
     // Step 1: build the list-resale transaction.
@@ -191,6 +203,7 @@ describe('Resale flow (e2e)', () => {
     });
 
     // List as the seller.
+    signListing(seller, ticket);
     currentUser = { userId: seller.id, email: seller.email, role: seller.role };
     const confirmListRes = await request(app.getHttpServer())
       .post(`/v1/tickets/${ticket.id}/confirm-list-resale`)
@@ -230,6 +243,7 @@ describe('Resale flow (e2e)', () => {
 
   it('does not allow two ACTIVE resale listings for the same ticket (#216)', async () => {
     const { seller, ticket } = await seedTicket();
+    signListing(seller, ticket);
     currentUser = { userId: seller.id, email: seller.email, role: seller.role };
 
     // Two concurrent confirm-list-resale calls race the application-level

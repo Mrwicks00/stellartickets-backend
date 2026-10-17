@@ -1,8 +1,11 @@
 import {
+  Account,
   BASE_FEE,
   Keypair,
+  Operation,
   nativeToScVal,
   Networks,
+  StrKey,
   Transaction,
   TransactionBuilder,
 } from '@stellar/stellar-sdk';
@@ -467,6 +470,113 @@ describe('StellarService (contract-mock harness)', () => {
       const relayed = server.sendTransaction.mock.calls[0][0];
       const signature = relayed.signatures[0].signature();
       expect(organizer.verify(relayed.hash(), signature)).toBe(false);
+    });
+  });
+
+  describe('decodeSignedInvocation (#375-#377)', () => {
+    it('decodes the contract call and native arguments of a signed envelope', async () => {
+      const { service } = createStellarHarness();
+      const unsigned = await service.buildIssueTicketTx({
+        organizerPublicKey: ORGANIZER,
+        chainEventId: CHAIN_EVENT_ID,
+        toPublicKey: ATTENDEE,
+        tier: 'GA',
+        seat: 'A-12',
+        price: 1_000_000n,
+      });
+      const signed = signAsWallet(unsigned, Networks.TESTNET, organizer);
+
+      expect(service.decodeSignedInvocation(signed)).toEqual({
+        functionName: 'issue_ticket',
+        args: [ORGANIZER, CHAIN_EVENT_ID, ATTENDEE, 'GA', 'A-12', 1_000_000n],
+      });
+    });
+
+    it('decodes the inner call of a fee-bump envelope', async () => {
+      const { service } = createStellarHarness();
+      const unsigned = await service.buildTransferTicketTx({
+        fromPublicKey: ATTENDEE,
+        chainTicketId: CHAIN_TICKET_ID,
+        toPublicKey: BUYER,
+      });
+      const inner = TransactionBuilder.fromXDR(
+        signAsWallet(unsigned, Networks.TESTNET, attendee),
+        Networks.TESTNET,
+      ) as Transaction;
+      const feeBump = TransactionBuilder.buildFeeBumpTransaction(
+        buyer,
+        '1000',
+        inner,
+        Networks.TESTNET,
+      );
+      feeBump.sign(buyer);
+
+      expect(service.decodeSignedInvocation(feeBump.toXDR())).toEqual({
+        functionName: 'transfer_ticket',
+        args: [ATTENDEE, CHAIN_TICKET_ID, BUYER],
+      });
+    });
+
+    it('rejects a call on a different contract', async () => {
+      const { service } = createStellarHarness();
+      const other = createStellarHarness({
+        contractId: StrKey.encodeContract(Buffer.alloc(32, 9)),
+      });
+      const unsigned = await other.service.buildListForResaleTx({
+        ownerPublicKey: ATTENDEE,
+        chainTicketId: CHAIN_TICKET_ID,
+        price: 1n,
+      });
+
+      expect(() => service.decodeSignedInvocation(unsigned)).toThrow(
+        /unexpected contract/,
+      );
+    });
+
+    it('rejects an envelope that is not a single contract invocation', () => {
+      const { service } = createStellarHarness();
+      const payment = new TransactionBuilder(new Account(ATTENDEE, '1'), {
+        fee: BASE_FEE,
+        networkPassphrase: Networks.TESTNET,
+      })
+        .addOperation(Operation.bumpSequence({ bumpTo: '10' }))
+        .setTimeout(30)
+        .build();
+
+      expect(() => service.decodeSignedInvocation(payment.toXDR())).toThrow(
+        /Expected invokeHostFunction/,
+      );
+    });
+
+    it('rejects an envelope with more than one operation', () => {
+      const { service } = createStellarHarness();
+      const tx = new TransactionBuilder(new Account(ATTENDEE, '1'), {
+        fee: BASE_FEE,
+        networkPassphrase: Networks.TESTNET,
+      })
+        .addOperation(Operation.bumpSequence({ bumpTo: '10' }))
+        .addOperation(Operation.bumpSequence({ bumpTo: '11' }))
+        .setTimeout(30)
+        .build();
+
+      expect(() => service.decodeSignedInvocation(tx.toXDR())).toThrow(
+        /Expected one operation, got 2/,
+      );
+    });
+
+    it('rejects a host function that is not a contract invocation', () => {
+      const { service } = createStellarHarness();
+      const tx = new TransactionBuilder(new Account(ATTENDEE, '1'), {
+        fee: BASE_FEE,
+        networkPassphrase: Networks.TESTNET,
+      })
+        .addOperation(Operation.uploadContractWasm({ wasm: Buffer.alloc(8) }))
+        .setTimeout(30)
+        .build();
+
+      expect(() => service.decodeSignedInvocation(tx.toXDR())).toThrow(
+        /Expected a contract invocation/,
+      );
     });
   });
 

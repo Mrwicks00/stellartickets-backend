@@ -6,6 +6,7 @@ import {
   Keypair,
   nativeToScVal,
   scValToNative,
+  Transaction,
   TransactionBuilder,
   rpc,
   BASE_FEE,
@@ -35,6 +36,13 @@ export interface OnChainEvent {
   maxResaleMultiplierBps: number;
   royaltyBps: number;
   ticketsIssued: bigint;
+}
+
+/** The single ticketing-contract call carried by a signed envelope. */
+export interface SignedInvocation {
+  functionName: string;
+  /** Arguments decoded to native values (bigint, string, number). */
+  args: unknown[];
 }
 
 /**
@@ -259,6 +267,42 @@ export class StellarService {
     );
     const returnValue = await this.pollTransaction(txHash, attempts);
     return { result: scValToNative(returnValue), txHash };
+  }
+
+  /**
+   * Decodes a wallet-signed envelope down to the ticketing-contract call it
+   * carries, so callers can check the signed arguments against the request
+   * before trusting either (#375, #376, #377). Throws unless the envelope is
+   * a single `invokeHostFunction` call on the configured contract — the only
+   * shape `build*Tx` ever produces.
+   */
+  decodeSignedInvocation(signedXdr: string): SignedInvocation {
+    const tx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
+    const inner = tx instanceof Transaction ? tx : tx.innerTransaction;
+    if (inner.operations.length !== 1) {
+      throw new Error(`Expected one operation, got ${inner.operations.length}`);
+    }
+    const [operation] = inner.operations;
+    if (operation.type !== 'invokeHostFunction') {
+      throw new Error(`Expected invokeHostFunction, got ${operation.type}`);
+    }
+    if (
+      operation.func.switch() !==
+      xdr.HostFunctionType.hostFunctionTypeInvokeContract()
+    ) {
+      throw new Error('Expected a contract invocation');
+    }
+    const invocation = operation.func.invokeContract();
+    const contractId = Address.fromScAddress(
+      invocation.contractAddress(),
+    ).toString();
+    if (contractId !== this.contract.contractId()) {
+      throw new Error(`Envelope targets an unexpected contract ${contractId}`);
+    }
+    return {
+      functionName: invocation.functionName().toString(),
+      args: invocation.args().map((arg) => scValToNative(arg) as unknown),
+    };
   }
 
   /**
